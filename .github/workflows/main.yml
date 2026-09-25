@@ -4,96 +4,199 @@ on:
   workflow_dispatch:
     inputs:
       kernel_release:
-        description: Unraid kernel release
+        description: Full Unraid kernel release
         required: true
         default: 6.18.38-Unraid
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: Build for ${{ inputs.kernel_release }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Resolve release
+      - name: Resolve kernel release and toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-          KERNEL_RELEASE: ${{ inputs.kernel_release }}
+          KERNEL_RELEASE_INPUT: ${{ inputs.kernel_release }}
         run: |
           set -euo pipefail
 
-          [[ "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+-Unraid$ ]]
+          KERNEL_RELEASE="$KERNEL_RELEASE_INPUT"
+          if [[ ! "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+-Unraid$ ]]; then
+            echo "Invalid kernel release: $KERNEL_RELEASE" >&2
+            exit 1
+          fi
 
-          release_json="$(curl -fsSL \
+          curl --fail --silent --show-error --location --retry 5 \
             -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/ich777/unraid_kernel/releases/tags/$KERNEL_RELEASE")"
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o "$RUNNER_TEMP/unraid-kernel-release.json" \
+            "https://api.github.com/repos/ich777/unraid_kernel/releases/tags/$KERNEL_RELEASE"
 
-          gcc_tag="$(jq -r .body <<<"$release_json" |
-            grep -oE 'gcc_[0-9]+\.[0-9]+\.[0-9]+' |
-            head -1)"
+          GCC_TAG="$(jq -r \
+            '.body | capture("(?<tag>gcc_[0-9]+\\.[0-9]+\\.[0-9]+)").tag' \
+            "$RUNNER_TEMP/unraid-kernel-release.json")"
 
-          test -n "$gcc_tag"
+          if [[ ! "$GCC_TAG" =~ ^gcc_[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unable to resolve GCC image tag from release metadata" >&2
+            exit 1
+          fi
 
-          echo "GCC_TAG=$gcc_tag" >> "$GITHUB_ENV"
-          echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
+          {
+            echo "KERNEL_RELEASE=$KERNEL_RELEASE"
+            echo "GCC_TAG=$GCC_TAG"
+            echo "IMAGE=ghcr.io/ich777/unraid_kernel:$GCC_TAG"
+          } >> "$GITHUB_ENV"
 
-      - name: Download kernel tree
+          echo "Kernel release: $KERNEL_RELEASE"
+          echo "Toolchain image: ghcr.io/ich777/unraid_kernel:$GCC_TAG"
+
+      - name: Download and verify kernel tree
         run: |
           set -euo pipefail
+
           mkdir -p build
+          BASE_URL="https://github.com/ich777/unraid_kernel/releases/download/$KERNEL_RELEASE"
+          ARCHIVE="linux-$KERNEL_RELEASE.tar.xz"
 
-          base="https://github.com/ich777/unraid_kernel/releases/download/$KERNEL_RELEASE"
+          curl --fail --location --retry 5 \
+            -o "build/$ARCHIVE" \
+            "$BASE_URL/$ARCHIVE"
+          curl --fail --location --retry 5 \
+            -o "build/$ARCHIVE.sha256" \
+            "$BASE_URL/$ARCHIVE.sha256"
 
-          curl -fL \
-            -o "build/linux-$KERNEL_RELEASE.tar.xz" \
-            "$base/linux-$KERNEL_RELEASE.tar.xz"
+          EXPECTED="$(awk '{print $1}' "build/$ARCHIVE.sha256")"
+          ACTUAL="$(sha256sum "build/$ARCHIVE" | awk '{print $1}')"
 
-          curl -fL \
-            -o "build/linux-$KERNEL_RELEASE.tar.xz.sha256" \
-            "$base/linux-$KERNEL_RELEASE.tar.xz.sha256"
-
-          expected="$(tr -d '[:space:]' \
-            < "build/linux-$KERNEL_RELEASE.tar.xz.sha256")"
-          actual="$(sha256sum "build/linux-$KERNEL_RELEASE.tar.xz" |
-            cut -d' ' -f1)"
-
-          test "$expected" = "$actual"
+          test -n "$EXPECTED"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Kernel archive SHA-256 verified: $ACTUAL"
 
           mkdir "build/linux-$KERNEL_RELEASE"
-          tar -xf "build/linux-$KERNEL_RELEASE.tar.xz" \
-            -C "build/linux-$KERNEL_RELEASE"
+          tar -xf "build/$ARCHIVE" -C "build/linux-$KERNEL_RELEASE"
+          rm -f "build/$ARCHIVE"
 
-      - name: Build modules
+          test -s "build/linux-$KERNEL_RELEASE/.config"
+          test -s "build/linux-$KERNEL_RELEASE/Module.symvers"
+          grep -E '^CONFIG_USB_USBNET=(m|y)$' \
+            "build/linux-$KERNEL_RELEASE/.config"
+
+      - name: Validate build script
         run: |
           set -euo pipefail
 
-          docker pull "ghcr.io/ich777/unraid_kernel:$GCC_TAG"
+          SCRIPT="$GITHUB_WORKSPACE/build-module-package.sh"
+          if [[ ! -f "$SCRIPT" ]]; then
+            echo "Build script not found: $SCRIPT" >&2
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          bash -n "$SCRIPT"
+          echo "BUILD_SCRIPT=$SCRIPT" >> "$GITHUB_ENV"
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+
+          docker pull "$IMAGE"
+          docker run --rm \
+            --entrypoint /bin/bash \
+            -e KERNEL_RELEASE="$KERNEL_RELEASE" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/build,target=/work" \
+            --mount "type=bind,source=$BUILD_SCRIPT,target=/build.sh,readonly" \
+            "$IMAGE" \
+            -lc 'bash /build.sh'
+
+      - name: Verify generated package
+        run: |
+          set -euo pipefail
+
+          mapfile -t PACKAGES < <(
+            find build/output -maxdepth 1 -type f -name '*.txz' -print
+          )
+          if [[ "${#PACKAGES[@]}" -ne 1 ]]; then
+            echo "Expected exactly one TXZ package, found ${#PACKAGES[@]}" >&2
+            printf '%s\n' "${PACKAGES[@]}"
+            exit 1
+          fi
+
+          PACKAGE="${PACKAGES[0]}"
+          PACKAGE_NAME="$(basename "$PACKAGE")"
+
+          cd build/output
+          md5sum -c "$PACKAGE_NAME.md5"
+          sha256sum -c "$PACKAGE_NAME.sha256"
+          xz -t "$PACKAGE_NAME"
+
+          diff -u \
+            <(printf '%s\n' \
+              '#!/bin/sh' \
+              '' \
+              '/sbin/depmod -a' \
+              '/sbin/modprobe qmi_wwan' \
+              '' \
+              'exit 0') \
+            <(tar -xOf "$PACKAGE_NAME" install/doinst.sh)
+
+          rm -rf "$RUNNER_TEMP/qmi-package-check"
+          mkdir -p "$RUNNER_TEMP/qmi-package-check"
+          tar -xf "$PACKAGE_NAME" -C "$RUNNER_TEMP/qmi-package-check"
 
           docker run --rm \
             --entrypoint /bin/bash \
             -e KERNEL_RELEASE="$KERNEL_RELEASE" \
-            -v "$PWD/build:/work" \
-            -v "$PWD/unraid-qmi-wwan/build-module-package.sh:/build.sh:ro" \
-            "ghcr.io/ich777/unraid_kernel:$GCC_TAG" \
-            /build.sh
+            --mount "type=bind,source=$RUNNER_TEMP/qmi-package-check,target=/verify,readonly" \
+            "$IMAGE" \
+            -lc '
+              set -euo pipefail
+              CDC=/verify/lib/modules/$KERNEL_RELEASE/kernel/drivers/usb/class/cdc-wdm.ko.xz
+              QMI=/verify/lib/modules/$KERNEL_RELEASE/kernel/drivers/net/usb/qmi_wwan.ko.xz
+              test -f "$CDC"
+              test -f "$QMI"
+              case "$(modinfo -F vermagic "$CDC")" in
+                "$KERNEL_RELEASE "*) ;;
+                *) exit 1 ;;
+              esac
+              case "$(modinfo -F vermagic "$QMI")" in
+                "$KERNEL_RELEASE "*) ;;
+                *) exit 1 ;;
+              esac
+              test "$(modinfo -F depends "$QMI")" = "usbnet,cdc-wdm"
+              modinfo -F vermagic "$QMI"
+              modinfo -F depends "$QMI"
+            '
 
-      - name: Verify package
-        run: |
-          set -euo pipefail
-          cd build/output
-          md5sum -c *.md5
-          sha256sum -c *.sha256
-          tar -tvf *.txz
-          tar -xOf *.txz install/doinst.sh
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: qmi-wwan-${{ inputs.kernel_release }}
+          name: qmi-wwan-${{ env.KERNEL_RELEASE }}
           path: |
             build/output/*.txz
             build/output/*.md5
             build/output/*.sha256
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Write build summary
+        run: |
+          {
+            echo "### qmi_wwan build complete"
+            echo
+            echo "- Kernel: \`$KERNEL_RELEASE\`"
+            echo "- Toolchain: \`$GCC_TAG\`"
+            echo "- Package: \`$PACKAGE_NAME\`"
+            echo "- Artifact: \`qmi-wwan-$KERNEL_RELEASE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
