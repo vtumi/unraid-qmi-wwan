@@ -1,0 +1,99 @@
+name: Build Unraid qmi_wwan
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_release:
+        description: Unraid kernel release
+        required: true
+        default: 6.18.38-Unraid
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_RELEASE: ${{ inputs.kernel_release }}
+        run: |
+          set -euo pipefail
+
+          [[ "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+-Unraid$ ]]
+
+          release_json="$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/ich777/unraid_kernel/releases/tags/$KERNEL_RELEASE")"
+
+          gcc_tag="$(jq -r .body <<<"$release_json" |
+            grep -oE 'gcc_[0-9]+\.[0-9]+\.[0-9]+' |
+            head -1)"
+
+          test -n "$gcc_tag"
+
+          echo "GCC_TAG=$gcc_tag" >> "$GITHUB_ENV"
+          echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
+
+      - name: Download kernel tree
+        run: |
+          set -euo pipefail
+          mkdir -p build
+
+          base="https://github.com/ich777/unraid_kernel/releases/download/$KERNEL_RELEASE"
+
+          curl -fL \
+            -o "build/linux-$KERNEL_RELEASE.tar.xz" \
+            "$base/linux-$KERNEL_RELEASE.tar.xz"
+
+          curl -fL \
+            -o "build/linux-$KERNEL_RELEASE.tar.xz.sha256" \
+            "$base/linux-$KERNEL_RELEASE.tar.xz.sha256"
+
+          expected="$(tr -d '[:space:]' \
+            < "build/linux-$KERNEL_RELEASE.tar.xz.sha256")"
+          actual="$(sha256sum "build/linux-$KERNEL_RELEASE.tar.xz" |
+            cut -d' ' -f1)"
+
+          test "$expected" = "$actual"
+
+          mkdir "build/linux-$KERNEL_RELEASE"
+          tar -xf "build/linux-$KERNEL_RELEASE.tar.xz" \
+            -C "build/linux-$KERNEL_RELEASE"
+
+      - name: Build modules
+        run: |
+          set -euo pipefail
+
+          docker pull "ghcr.io/ich777/unraid_kernel:$GCC_TAG"
+
+          docker run --rm \
+            --entrypoint /bin/bash \
+            -e KERNEL_RELEASE="$KERNEL_RELEASE" \
+            -v "$PWD/build:/work" \
+            -v "$PWD/unraid-qmi-wwan/build-module-package.sh:/build.sh:ro" \
+            "ghcr.io/ich777/unraid_kernel:$GCC_TAG" \
+            /build.sh
+
+      - name: Verify package
+        run: |
+          set -euo pipefail
+          cd build/output
+          md5sum -c *.md5
+          sha256sum -c *.sha256
+          tar -tvf *.txz
+          tar -xOf *.txz install/doinst.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qmi-wwan-${{ inputs.kernel_release }}
+          path: |
+            build/output/*.txz
+            build/output/*.md5
+            build/output/*.sha256
+          if-no-files-found: error
